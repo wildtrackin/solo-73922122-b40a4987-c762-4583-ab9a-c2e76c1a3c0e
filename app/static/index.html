@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Avro 契约注册中心</title>
+<style>
+  :root { --bg:#0f1420; --panel:#182033; --panel2:#1f2a44; --line:#2c3a5e; --fg:#dfe7f5;
+          --dim:#8fa0c0; --ok:#3ecf8e; --bad:#ff6b6b; --accent:#5aa9ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.55 "SF Mono", "Cascadia Code", Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+  header { display:flex; align-items:center; gap:12px; padding:12px 20px; background:var(--panel);
+           border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:17px; margin:0; }
+  .badge { background:var(--panel2); border:1px solid var(--line); border-radius:6px;
+           padding:2px 10px; color:var(--accent); }
+  main { display:grid; grid-template-columns: 340px 1fr; gap:16px; padding:16px 20px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:16px; }
+  h2 { font-size:14px; margin:0 0 10px; color:var(--accent); letter-spacing:.5px; }
+  h3 { font-size:13px; margin:14px 0 6px; color:var(--dim); }
+  textarea, input[type=text], input[type=number] { width:100%; background:var(--panel2); color:var(--fg);
+           border:1px solid var(--line); border-radius:6px; padding:8px; font:inherit; }
+  textarea { min-height:110px; resize:vertical; }
+  button { background:var(--accent); color:#06121f; border:0; border-radius:6px; padding:7px 14px;
+           font:inherit; font-weight:600; cursor:pointer; margin:4px 6px 4px 0; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button.warn { background:#e2b93b; }
+  button:hover { filter:brightness(1.12); }
+  .link-item { padding:7px 10px; border:1px solid var(--line); border-radius:6px; margin-bottom:6px;
+               cursor:pointer; display:flex; justify-content:space-between; }
+  .link-item:hover, .link-item.sel { background:var(--panel2); border-color:var(--accent); }
+  .link-item .v { color:var(--dim); }
+  pre { background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:10px;
+        overflow:auto; max-height:300px; margin:6px 0; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .dim { color:var(--dim); }
+  .conflict { border-left:3px solid var(--bad); background:#2a1a22; padding:6px 10px; margin:6px 0; border-radius:0 6px 6px 0; }
+  .conflict .path { color:#ffb3b3; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; }
+  .row > * { flex:1; min-width:220px; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { border:1px solid var(--line); padding:5px 8px; text-align:left; vertical-align:top; }
+  th { color:var(--dim); font-weight:600; }
+  #result { min-height:30px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; margin-left:6px; }
+  .pill.ok { background:#123b2a; color:var(--ok); } .pill.bad { background:#3d1a1a; color:var(--bad); }
+  details { margin:4px 0; } summary { cursor:pointer; color:var(--dim); }
+  footer { color:var(--dim); padding:10px 20px 30px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Avro 契约注册中心</h1>
+  <span class="badge" id="serverBadge">进程: …</span>
+  <span class="dim" id="dbBadge"></span>
+  <span style="flex:1"></span>
+  <button class="ghost" onclick="refreshAll()">刷新</button>
+</header>
+
+<main>
+  <div>
+    <section>
+      <h2>链路列表</h2>
+      <div id="linkList" class="dim">加载中…</div>
+    </section>
+    <section>
+      <h2>创建链路（初建即校验兼容）</h2>
+      <input type="text" id="newName" placeholder="链路名，如 orders-pipeline">
+      <h3>Writer 模式</h3>
+      <textarea id="newWriter" spellcheck="false"></textarea>
+      <h3>Reader 模式</h3>
+      <textarea id="newReader" spellcheck="false"></textarea>
+      <button onclick="createLink()">创建</button>
+    </section>
+    <section>
+      <h2>并发演示（int 写端 / long 读端）</h2>
+      <p class="dim">链路 <code>demo-int-long</code>：writer=<b>int</b>、reader=<b>long</b>。
+        第 2 步把 writer 改为 <b>long</b>、同时把 reader 改为 <b>int</b>
+        （两端各带 800ms 演示延迟，预检都能通过）。若两次提交都成功将留下
+        writer=long / reader=int 的不兼容组合——提交时按当时状态重新裁决，
+        后提交者必然被 409 拒绝，旧契约保留。</p>
+      <button class="warn" onclick="demoReset()">1. 创建 / 重置演示链路</button>
+      <button class="warn" onclick="demoRace()">2. 并发提交两端修改</button>
+      <div id="demoOut"></div>
+      <p class="dim">命令行版本（打到两个不同进程）：<code>demo/race_demo.sh</code></p>
+    </section>
+  </div>
+
+  <div>
+    <section>
+      <h2>链路详情</h2>
+      <div id="detail" class="dim">请选择左侧链路</div>
+    </section>
+    <section>
+      <h2>发布新模式</h2>
+      <div class="row">
+        <div>
+          <h3>新 Writer（须能被当前 reader 读取）</h3>
+          <textarea id="pubWriter" spellcheck="false"></textarea>
+        </div>
+        <div>
+          <h3>新 Reader（须能读全部历史 writer）</h3>
+          <textarea id="pubReader" spellcheck="false"></textarea>
+        </div>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <div>
+          <button class="ghost" onclick="dryCheck('writer')">检查</button>
+          <button onclick="publish('writer')">发布 Writer</button>
+        </div>
+        <div>
+          <button class="ghost" onclick="dryCheck('reader')">检查</button>
+          <button onclick="publish('reader')">发布 Reader</button>
+        </div>
+      </div>
+      <div class="row">
+        <div>演示延迟 ms（仅用于并发演示）：<input type="number" id="delayMs" value="0" min="0" max="10000" style="width:110px;display:inline-block"></div>
+      </div>
+      <div id="result"></div>
+    </section>
+  </div>
+</main>
+<footer>兼容检查不持 SQLite 写锁；发布在 BEGIN IMMEDIATE 事务内按提交时状态重新裁决，失败回滚保留旧契约；当前 writer 与历史同事务提交，重启保留。</footer>
+
+<script>
+let current = null;
+
+const DEMO = {
+  name: "demo-int-long",
+  wInt:  {type:"record",name:"Demo",fields:[{name:"v",type:"int"}]},
+  rLong: {type:"record",name:"Demo",fields:[{name:"v",type:"long"}]},
+  wLong: {type:"record",name:"Demo",fields:[{name:"v",type:"long"}]},
+  rInt:  {type:"record",name:"Demo",fields:[{name:"v",type:"int"}]},
+};
+
+async function api(path, opts = {}) {
+  if (opts.body && typeof opts.body !== "string") {
+    opts.body = JSON.stringify(opts.body);
+    opts.headers = {"Content-Type": "application/json"};
+  }
+  const resp = await fetch(path, opts);
+  let data = null;
+  try { data = await resp.json(); } catch (e) { /* ignore */ }
+  return { status: resp.status, ok: resp.ok, data, server: resp.headers.get("X-Server-Id") };
+}
+
+const pretty = o => JSON.stringify(o, null, 2);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function parseTa(id) {
+  const txt = document.getElementById(id).value.trim();
+  if (!txt) throw "模式内容为空";
+  try { return JSON.parse(txt); } catch (e) { throw "JSON 解析失败: " + e.message; }
+}
+
+async function refreshInfo() {
+  const r = await api("/api/info");
+  if (r.ok) {
+    document.getElementById("serverBadge").textContent = "进程: " + r.data.server_id;
+    document.getElementById("dbBadge").textContent = "库文件: " + r.data.db_path + "（链路数 " + r.data.links + "）";
+  }
+}
+
+async function refreshLinks() {
+  const r = await api("/api/links");
+  const el = document.getElementById("linkList");
+  if (!r.ok) { el.textContent = "加载失败"; return; }
+  if (!r.data.links.length) { el.innerHTML = '<span class="dim">暂无链路，请先创建</span>'; return; }
+  el.innerHTML = r.data.links.map(l =>
+    `<div class="link-item ${l.name === current ? "sel" : ""}" onclick="selectLink('${esc(l.name)}')">
+       <span>${esc(l.name)}</span><span class="v">v${l.version}</span></div>`).join("");
+}
+
+async function selectLink(name) {
+  current = name;
+  await refreshLinks();
+  const r = await api("/api/links/" + encodeURIComponent(name));
+  const el = document.getElementById("detail");
+  if (!r.ok) { el.innerHTML = '<span class="bad">加载失败</span>'; return; }
+  const d = r.data;
+  let html = `<div><b>${esc(d.name)}</b> <span class="pill ok">version ${d.version}</span>
+              <span class="dim">更新于 ${esc(d.updated_at)}（由进程 ${esc(r.server)} 读取）</span></div>`;
+  html += `<div class="row"><div><h3>当前 Writer</h3><pre>${esc(pretty(d.writer))}</pre></div>
+           <div><h3>当前 Reader</h3><pre>${esc(pretty(d.reader))}</pre></div></div>`;
+  html += `<h3>Writer 发布历史（共 ${d.history.length} 版，最大 seq 即当前 writer）</h3>`;
+  d.history.slice().reverse().forEach(h => {
+    html += `<details ${h.seq === d.history.length ? "open" : ""}>
+      <summary>#${h.seq} · ${esc(h.published_at)}</summary><pre>${esc(pretty(h.schema))}</pre></details>`;
+  });
+  el.innerHTML = html;
+  document.getElementById("pubWriter").value = pretty(d.writer);
+  document.getElementById("pubReader").value = pretty(d.reader);
+}
+
+function renderConflicts(target, title, conflicts, stage) {
+  const el = document.getElementById(target);
+  let html = `<div class="bad"><b>${esc(title)}</b>${stage ? ` <span class="pill bad">裁决阶段: ${esc(stage)}</span>` : ""}</div>`;
+  (conflicts || []).forEach(c => {
+    const seq = c.writer_seq != null ? `历史 writer #${c.writer_seq} · ` : "";
+    html += `<div class="conflict"><div class="path">${esc(seq)}${esc(c.path)}</div><div>${esc(c.message)}</div></div>`;
+  });
+  el.innerHTML = html;
+}
+
+async function createLink() {
+  let body;
+  try {
+    body = { name: document.getElementById("newName").value.trim(),
+             writer: parseTa("newWriter"), reader: parseTa("newReader") };
+  } catch (e) { renderConflicts("result", String(e), []); return; }
+  const r = await api("/api/links", { method: "POST", body });
+  if (r.ok) {
+    document.getElementById("result").innerHTML = `<div class="ok">✔ 链路 ${esc(body.name)} 已创建（进程 ${esc(r.server)}）</div>`;
+    current = body.name;
+    await refreshLinks(); await selectLink(body.name);
+  } else if (r.data && r.data.detail && r.data.detail.conflicts) {
+    renderConflicts("result", "✘ 创建被拒绝：" + r.data.detail.message, r.data.detail.conflicts, r.data.detail.stage);
+  } else {
+    renderConflicts("result", "✘ " + (r.data && r.data.detail ? JSON.stringify(r.data.detail) : r.status), []);
+  }
+}
+
+async function publish(end) {
+  if (!current) { alert("请先选择链路"); return; }
+  let schema;
+  try { schema = parseTa(end === "writer" ? "pubWriter" : "pubReader"); }
+  catch (e) { renderConflicts("result", String(e), []); return; }
+  const delay = parseInt(document.getElementById("delayMs").value || "0", 10);
+  const r = await api(`/api/links/${encodeURIComponent(current)}/${end}`,
+                      { method: "PUT", body: { schema, demo_delay_ms: delay } });
+  if (r.ok) {
+    document.getElementById("result").innerHTML =
+      `<div class="ok">✔ ${end} 已发布，version ${r.data.state.version}（进程 ${esc(r.server)}）</div>`;
+    await selectLink(current);
+  } else if (r.data && r.data.detail && r.data.detail.conflicts !== undefined) {
+    renderConflicts("result", `✘ 发布被拒绝：${r.data.detail.message}`, r.data.detail.conflicts, r.data.detail.stage);
+    if (r.data.detail.state) await selectLink(current);
+  } else {
+    renderConflicts("result", "✘ " + r.status, []);
+  }
+}
+
+async function dryCheck(end) {
+  if (!current) { alert("请先选择链路"); return; }
+  let schema;
+  try { schema = parseTa(end === "writer" ? "pubWriter" : "pubReader"); }
+  catch (e) { renderConflicts("result", String(e), []); return; }
+  const r = await api(`/api/links/${encodeURIComponent(current)}/check`, { method: "POST", body: { end, schema } });
+  if (r.ok && r.data.ok) {
+    document.getElementById("result").innerHTML = `<div class="ok">✔ 检查通过（未提交）</div>`;
+  } else if (r.ok) {
+    renderConflicts("result", "✘ 检查未通过（未提交）", r.data.conflicts);
+  } else {
+    renderConflicts("result", "✘ " + (r.data && r.data.detail ? JSON.stringify(r.data.detail) : r.status), []);
+  }
+}
+
+// ---------------- 并发演示 ----------------
+async function demoReset() {
+  await api("/api/links/" + DEMO.name, { method: "DELETE" });
+  const r = await api("/api/links", { method: "POST", body: { name: DEMO.name, writer: DEMO.wInt, reader: DEMO.rLong } });
+  const el = document.getElementById("demoOut");
+  if (r.ok) {
+    el.innerHTML = `<div class="ok">✔ 演示链路已就绪：writer=int, reader=long（进程 ${esc(r.server)}）</div>`;
+    current = DEMO.name; await refreshLinks(); await selectLink(DEMO.name);
+  } else {
+    el.innerHTML = `<div class="bad">✘ 初始化失败: ${esc(JSON.stringify(r.data))}</div>`;
+  }
+}
+
+async function demoRace() {
+  const el = document.getElementById("demoOut");
+  el.innerHTML = '<span class="dim">两个请求已同时发出（各带 800ms 演示延迟）…</span>';
+  const [w, r] = await Promise.all([
+    api(`/api/links/${DEMO.name}/writer`, { method: "PUT", body: { schema: DEMO.wLong, demo_delay_ms: 800 } }),
+    api(`/api/links/${DEMO.name}/reader`, { method: "PUT", body: { schema: DEMO.rInt,  demo_delay_ms: 800 } }),
+  ]);
+  const fmt = (label, x) => {
+    if (x.ok) return `<div class="ok">✔ ${label}: 提交成功（进程 ${esc(x.server)}）</div>`;
+    const d = x.data && x.data.detail || {};
+    const cf = (d.conflicts || []).map(c =>
+      `<div class="conflict"><div class="path">${c.writer_seq != null ? "历史 writer #" + c.writer_seq + " · " : ""}${esc(c.path)}</div><div>${esc(c.message)}</div></div>`).join("");
+    return `<div class="bad">✘ ${label}: HTTP ${x.status} — ${esc(d.message || "")}
+            <span class="pill bad">裁决阶段: ${esc(d.stage || "?")}</span></div>${cf}`;
+  };
+  el.innerHTML = fmt("writer → long", w) + fmt("reader → int", r) +
+    `<div class="dim">预期结果：一个成功、一个 409；最终契约必然仍然兼容。刷新详情可见旧契约被保留的一侧。</div>`;
+  current = DEMO.name; await refreshLinks(); await selectLink(DEMO.name);
+}
+
+async function refreshAll() { await refreshInfo(); await refreshLinks(); if (current) await selectLink(current); }
+
+// 预填一个示例
+document.getElementById("newWriter").value = pretty({type:"record",name:"Order",namespace:"demo",fields:[{name:"id",type:"long"},{name:"amount",type:"int"}]});
+document.getElementById("newReader").value = pretty({type:"record",name:"Order",namespace:"demo",fields:[{name:"id",type:"long"},{name:"amount",type:"long"},{name:"note",type:["null","string"],default:null}]});
+refreshAll();
+</script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+services:
+  web1:
+    build: .
+    environment:
+      DB_PATH: /data/contracts.db
+      SERVER_ID: web1
+    volumes:
+      - contracts:/data
+    ports:
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/info')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  web2:
+    build: .
+    environment:
+      DB_PATH: /data/contracts.db
+      SERVER_ID: web2
+    volumes:
+      - contracts:/data
+    ports:
+      - "8002:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/info')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  contracts:   # SQLite 库文件持久化卷：两个进程共库，重启保留
