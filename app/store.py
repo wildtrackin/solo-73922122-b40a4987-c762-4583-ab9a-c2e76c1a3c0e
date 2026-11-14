@@ -62,6 +62,7 @@ class PublishResult:
     stage: str = ""                 # "pre-check" | "commit"（拒绝时所处的裁决阶段）
     conflicts: List[dict] = field(default_factory=list)
     state: Optional[dict] = None    # 成功后的新状态 / 拒绝时库中的当前状态
+    error: str = "incompatible"     # "incompatible" | "stale"（旧候选：确认前链路已被修改）
 
 
 def _now() -> str:
@@ -124,13 +125,18 @@ class Store:
     def get_link(self, name: str) -> Optional[dict]:
         conn = self._connect()
         try:
+            # 显式只读事务：links 行与 writer 历史取自同一已提交快照（WAL 快照隔离，
+            # 不阻塞其他进程的读写），保证生成候选时版本号与历史一致
+            conn.execute("BEGIN")
             row = conn.execute("SELECT * FROM links WHERE name = ?", (name,)).fetchone()
             if row is None:
+                conn.execute("COMMIT")
                 return None
             hist = conn.execute(
                 "SELECT seq, schema, published_at FROM writer_history WHERE link = ? ORDER BY seq",
                 (name,),
             ).fetchall()
+            conn.execute("COMMIT")
             return self._link_dict(row, hist)
         finally:
             conn.close()
@@ -261,6 +267,68 @@ class Store:
                 hist = conn.execute(
                     "SELECT seq, schema FROM writer_history WHERE link = ? ORDER BY seq", (name,)
                 ).fetchall()
+                conflicts = check_all([{"seq": h["seq"], "schema": h["schema"]} for h in hist])
+                if conflicts:
+                    conn.execute("ROLLBACK")
+                    return PublishResult(ok=False, stage="commit", conflicts=conflicts, state=self.get_link(name))
+                conn.execute(
+                    "UPDATE links SET reader = ?, version = version + 1, updated_at = ? WHERE name = ?",
+                    (reader_json, _now(), name),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+        return PublishResult(ok=True, state=self.get_link(name))
+
+    # ------------------------------------------------------------------
+    # 确认发布统一 reader 候选：候选必须仍基于当前已提交版本，
+    # 且提交时须再次通过全部历史兼容检查；任一不满足都回滚，
+    # 已提交的 reader 与 writer 历史原样保留。
+    # ------------------------------------------------------------------
+    def confirm_reader(self, name: str, reader_json: str, base_version: int,
+                       writer_seqs: List[int], check_fn: CheckFn) -> PublishResult:
+        reader_obj = compat.parse_schema(reader_json)
+
+        def check_all(history: List[dict]) -> List[dict]:
+            conflicts: List[dict] = []
+            for h in history:
+                res = check_fn(compat.parse_schema(h["schema"]), reader_obj)
+                conflicts.extend(_tag(res.to_list(), h["seq"]))
+            return conflicts
+
+        def is_current(version: int, seqs: List[int]) -> bool:
+            return version == base_version and seqs == list(writer_seqs)
+
+        # 阶段 1：快照预检（无锁）——版本/历史序号任一变化即视为旧候选
+        snap = self.get_link(name)
+        if snap is None:
+            raise LinkNotFound(name)
+        if not is_current(snap["version"], [h["seq"] for h in snap["history"]]):
+            return PublishResult(ok=False, error="stale", stage="pre-check", state=snap)
+        pre_conflicts = check_all(snap["history"])
+        if pre_conflicts:
+            return PublishResult(ok=False, stage="pre-check", conflicts=pre_conflicts, state=snap)
+
+        # 阶段 2：提交时按库中最新状态重新裁决（持写锁，事务尽量短）
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute("SELECT version FROM links WHERE name = ?", (name,)).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    raise LinkNotFound(name)
+                hist = conn.execute(
+                    "SELECT seq, schema FROM writer_history WHERE link = ? ORDER BY seq", (name,)
+                ).fetchall()
+                if not is_current(row["version"], [h["seq"] for h in hist]):
+                    # 确认前另一进程改过链路：拒绝旧候选，不覆盖已提交契约
+                    conn.execute("ROLLBACK")
+                    return PublishResult(ok=False, error="stale", stage="commit", state=self.get_link(name))
                 conflicts = check_all([{"seq": h["seq"], "schema": h["schema"]} for h in hist])
                 if conflicts:
                     conn.execute("ROLLBACK")

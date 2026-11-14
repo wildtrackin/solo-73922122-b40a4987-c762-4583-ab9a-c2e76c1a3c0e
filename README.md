@@ -2,7 +2,8 @@
 
 数据平台契约发布网页：每条数据链路登记**当前 writer 模式、当前 reader 模式
 及全部已发布 writer 历史**，任何一端升级 Avro 模式前都必须通过兼容性裁决，
-把无法解码的结构挡在数据链路之外。
+把无法解码的结构挡在数据链路之外。支持从全部 writer 历史**生成保留历史字段的
+统一 reader 候选**，工程师确认后发布（确认前链路被其他进程修改则拒绝旧候选）。
 
 技术栈：FastAPI + avro（Apache Avro Python 包）+ SQLite。
 
@@ -38,6 +39,16 @@ docker compose up --build
   以及 record/enum/fixed **别名**与字段**别名**（相对别名按 reader 命名空间补全）。
 - **拒绝时显示冲突路径**：如 `$.v`、`$.payload.items[]`、`$.next|writer#1(Node).v`，
   并标注冲突来自哪一版历史 writer（`writer_seq`）。
+- **统一 reader 生成**：把同一已提交版本的全部 writer 历史合并为一个保留历史字段的
+  reader 候选。仅处理各版 writer 均为**同名 record**、顶层字段为**原始类型**或
+  **null+原始类型 union** 的链路；数值类型取共同读端类型
+  （int→long→float→double 提升链上的最大者），其余混合用合法 union 承接；
+  字段在某些版本缺席时并入 null 分支并补 null 默认值。页面展示候选模式与覆盖的
+  writer 序号；无法合并时返回 422 并给出字段路径（如 `$.payload`）。
+- **候选确认是乐观并发**：候选绑定生成时的链路版本（`base_version` + 覆盖的
+  `writer_seqs`）。确认前若另一进程改过链路（任一端发布成功都会使版本 +1），
+  旧候选被 409（`error: "stale"`）拒绝，已提交的 reader 与 writer 历史原样保留；
+  确认成功前仍会在提交事务内重新通过全部历史兼容检查。
 - **失败保留旧契约**：任何拒绝都发生在事务外或回滚内，库中契约原样不动。
 - **当前模式与历史一起提交**：发布 writer 时，历史 INSERT 与当前模式 UPDATE
   在同一事务内完成。
@@ -89,6 +100,14 @@ docker compose up --build
    多跑几次可看到另一种胜负（reader→int 成功、writer→long 被 409），
    两种结局的最终状态都兼容。
 
+### 可控演示：统一 reader 的旧候选拒绝
+
+1. 浏览器开 web1（:8001）：选中一条多版本链路 →「统一 Reader」→ **生成统一 Reader 候选**
+   （页面展示候选模式、覆盖的 writer 序号与所基于的链路版本）。
+2. 浏览器开 web2（:8002）：对同一链路**发布任一端**的新模式（版本 +1）。
+3. 回到 web1 点 **确认发布为 Reader** → 409 `stale`，旧候选被拒绝，
+   已提交的 reader 与 writer 历史不被覆盖；重新生成后即可确认成功。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -100,6 +119,8 @@ docker compose up --build
 | PUT | `/api/links/{name}/writer` | 发布新 writer `{schema, demo_delay_ms?}` |
 | PUT | `/api/links/{name}/reader` | 发布新 reader `{schema, demo_delay_ms?}` |
 | POST | `/api/links/{name}/check` | 试算 `{end, schema}`，只检查不提交 |
+| POST | `/api/links/{name}/reader-candidates` | 生成统一 reader 候选（只读）：返回候选模式、覆盖的 `writer_seqs`、`base_version`；无法合并返回 422 + 字段路径 |
+| POST | `/api/links/{name}/reader-candidates/confirm` | 确认发布候选 `{schema, base_version, writer_seqs}`；链路已被修改返回 409 `stale`，不兼容返回 409 `incompatible` |
 | DELETE | `/api/links/{name}` | 删除链路（演示重置用） |
 
 - `schema` 接受 JSON 对象或 JSON 字符串；非法 JSON/非法 Avro 模式返回 400。
@@ -119,7 +140,7 @@ docker compose up --build
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt pytest httpx
-pytest tests/ -q                     # 32 个用例：规则 / 历史 / 回滚 / 重启保留 / 并发裁决
+pytest tests/ -q                     # 63 个用例：规则 / 历史 / 回滚 / 重启保留 / 并发裁决 / 统一 reader 合并与确认
 
 # 本地起两个共库进程（不用 Docker）
 DB_PATH=/tmp/contracts.db SERVER_ID=web1 uvicorn app.main:app --port 8001 &
@@ -132,8 +153,9 @@ DB_PATH=/tmp/contracts.db SERVER_ID=web2 uvicorn app.main:app --port 8002 &
 app/
   main.py            FastAPI 路由与错误映射
   compat.py          Avro writer→reader 兼容性检查（冲突路径）
+  merge.py           历史 writer 合并为统一 reader 候选（数值提升 / union 承接 / null 补齐）
   store.py           SQLite 存储与两阶段发布（预检无锁 / 提交时裁决）
-  static/index.html  网页界面（建链路、发布、查询、并发演示）
+  static/index.html  网页界面（建链路、发布、查询、统一 reader 生成确认、并发演示）
 demo/race_demo.sh    跨进程并发演示脚本
 tests/               pytest 用例
 Dockerfile / docker-compose.yml / requirements.txt

@@ -92,6 +92,18 @@
       <div id="detail" class="dim">请选择左侧链路</div>
     </section>
     <section>
+      <h2>统一 Reader（合并全部历史 writer）</h2>
+      <p class="dim">仅适用于：各版 writer 均为<b>同名 record</b>，顶层字段为<b>原始类型</b>或
+        <b>null+原始类型 union</b>。数值类型取共同读端类型（int→long→float→double），
+        其余混合用合法 union 承接；字段在某些版本缺席时补 null 默认值。
+        候选基于生成时的链路版本；确认前若另一进程改过链路，旧候选将被拒绝。</p>
+      <button onclick="genCandidate()">生成统一 Reader 候选</button>
+      <button id="candConfirmBtn" style="display:none" onclick="confirmCandidate()">确认发布为 Reader</button>
+      <div id="candMeta" style="margin:6px 0"></div>
+      <div id="candOut"></div>
+      <div id="candResult"></div>
+    </section>
+    <section>
       <h2>发布新模式</h2>
       <div class="row">
         <div>
@@ -124,6 +136,7 @@
 
 <script>
 let current = null;
+let candidate = null;  // 待确认的统一 reader 候选 {reader, writer_seqs, base_version, link}
 
 const DEMO = {
   name: "demo-int-long",
@@ -173,6 +186,7 @@ async function refreshLinks() {
 
 async function selectLink(name) {
   current = name;
+  clearCandidate();
   await refreshLinks();
   const r = await api("/api/links/" + encodeURIComponent(name));
   const el = document.getElementById("detail");
@@ -252,6 +266,56 @@ async function dryCheck(end) {
     renderConflicts("result", "✘ 检查未通过（未提交）", r.data.conflicts);
   } else {
     renderConflicts("result", "✘ " + (r.data && r.data.detail ? JSON.stringify(r.data.detail) : r.status), []);
+  }
+}
+
+// ---------------- 统一 Reader 生成 / 确认 ----------------
+function clearCandidate() {
+  candidate = null;
+  document.getElementById("candConfirmBtn").style.display = "none";
+  document.getElementById("candMeta").innerHTML = "";
+  document.getElementById("candOut").innerHTML = "";
+  document.getElementById("candResult").innerHTML = "";
+}
+
+async function genCandidate() {
+  if (!current) { alert("请先选择链路"); return; }
+  clearCandidate();
+  const r = await api(`/api/links/${encodeURIComponent(current)}/reader-candidates`, { method: "POST" });
+  if (r.ok) {
+    candidate = { ...r.data.candidate, link: current };
+    document.getElementById("candMeta").innerHTML =
+      `<span class="pill ok">覆盖 writer ${candidate.writer_seqs.map(s => "#" + s).join(" ")}</span>` +
+      `<span class="pill ok">基于 version ${candidate.base_version}</span>` +
+      `<span class="dim">（由进程 ${esc(r.server)} 生成）</span>`;
+    document.getElementById("candOut").innerHTML =
+      `<h3>候选统一 Reader</h3><pre>${esc(pretty(candidate.reader))}</pre>`;
+    document.getElementById("candConfirmBtn").style.display = "";
+  } else if (r.status === 422 && r.data && r.data.detail) {
+    renderConflicts("candOut", "✘ 无法合并：" + r.data.detail.message, r.data.detail.conflicts || []);
+  } else {
+    renderConflicts("candOut", "✘ " + (r.data && r.data.detail ? JSON.stringify(r.data.detail) : r.status), []);
+  }
+}
+
+async function confirmCandidate() {
+  if (!candidate) { alert("请先生成候选"); return; }
+  const r = await api(`/api/links/${encodeURIComponent(candidate.link)}/reader-candidates/confirm`,
+    { method: "POST", body: { schema: candidate.reader, base_version: candidate.base_version,
+                              writer_seqs: candidate.writer_seqs } });
+  const link = candidate.link;
+  const d = (r.data && r.data.detail) || {};
+  // 先刷新链路状态（selectLink 会清空候选区），最后再把结果写回消息区
+  if (r.ok || d.error === "stale" || d.state) { await refreshLinks(); await selectLink(link); }
+  if (r.ok) {
+    document.getElementById("candResult").innerHTML =
+      `<div class="ok">✔ 统一 reader 已发布，version ${r.data.state.version}（进程 ${esc(r.server)}）</div>`;
+  } else if (d.error === "stale") {
+    renderConflicts("candResult", "✘ 旧候选被拒绝：" + d.message, [], d.stage);
+  } else if (d.conflicts !== undefined) {
+    renderConflicts("candResult", "✘ 确认被拒绝：" + d.message, d.conflicts, d.stage);
+  } else {
+    renderConflicts("candResult", "✘ " + r.status, []);
   }
 }
 

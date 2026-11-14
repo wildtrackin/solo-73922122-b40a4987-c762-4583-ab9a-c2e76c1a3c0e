@@ -6,14 +6,14 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from . import compat, store
+from . import compat, merge, store
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "..", "data", "contracts.db"))
 SERVER_ID = os.environ.get("SERVER_ID", "dev")
@@ -39,6 +39,15 @@ class PublishBody(BaseModel):
 class CheckBody(BaseModel):
     end: Literal["writer", "reader"]
     schema_: Any = Field(alias="schema")
+
+    model_config = {"populate_by_name": True}
+
+
+class CandidateConfirm(BaseModel):
+    """确认发布统一 reader 候选：base_version / writer_seqs 来自生成响应，作为乐观并发令牌。"""
+    schema_: Any = Field(alias="schema")
+    base_version: int = Field(ge=1)
+    writer_seqs: List[int] = Field(min_length=1)
 
     model_config = {"populate_by_name": True}
 
@@ -140,6 +149,63 @@ def create_app(st: Optional[store.Store] = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"链路 {name!r} 不存在")
         if not result.ok:
             raise _reject(result, "新 reader 无法读取全部历史 writer，已保留旧契约")
+        return {"ok": True, "server_id": SERVER_ID, "state": result.state}
+
+    @app.post("/api/links/{name}/reader-candidates")
+    def generate_reader_candidate(name: str):
+        """生成统一 reader 候选：读取当前已提交版本的全部 writer 历史并合并字段。
+
+        只读不写库；返回候选模式、覆盖的 writer 序号与所基于的链路版本。
+        """
+        link = st.get_link(name)
+        if link is None:
+            raise HTTPException(status_code=404, detail=f"链路 {name!r} 不存在")
+        result = merge.build_unified_reader(link["history"])
+        if not result.ok:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "unmergeable",
+                    "message": "历史 writer 无法合并为统一 reader"
+                               "（仅支持：各版均为同名 record，顶层字段为原始类型或 null+原始类型 union）",
+                    "conflicts": result.conflicts,
+                    "state": link,
+                },
+            )
+        return {
+            "ok": True,
+            "server_id": SERVER_ID,
+            "candidate": {
+                "reader": result.reader,
+                "writer_seqs": result.writer_seqs,
+                "base_version": link["version"],
+            },
+        }
+
+    @app.post("/api/links/{name}/reader-candidates/confirm")
+    def confirm_reader_candidate(name: str, body: CandidateConfirm):
+        """确认发布候选：确认前链路被其他进程改过则拒绝旧候选（不覆盖已提交契约）；
+        通过时仍须在提交事务内重新通过全部历史兼容检查。"""
+        reader_json = _normalize_schema(body.schema_)
+        try:
+            result = st.confirm_reader(
+                name, reader_json, body.base_version, body.writer_seqs, compat.check_compatibility
+            )
+        except store.LinkNotFound:
+            raise HTTPException(status_code=404, detail=f"链路 {name!r} 不存在")
+        if not result.ok:
+            if result.error == "stale":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "stale",
+                        "stage": result.stage,
+                        "message": "确认前链路已被其他进程修改，旧候选已拒绝；"
+                                   "已提交的 reader 与 writer 历史未被覆盖",
+                        "state": result.state,
+                    },
+                )
+            raise _reject(result, "统一 reader 未通过全部历史兼容检查，已保留旧契约")
         return {"ok": True, "server_id": SERVER_ID, "state": result.state}
 
     @app.post("/api/links/{name}/check")
